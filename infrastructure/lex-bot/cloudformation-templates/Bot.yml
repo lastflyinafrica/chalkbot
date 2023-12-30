@@ -1,0 +1,119 @@
+# CAMBRIDGE LICENSES THE SOFTWARE "AS IS," AND MAKES NO EXPRESS OR IMPLIED WARRANTY OF ANY KIND. 
+# CAMBRIDGE SPECIFICALLY DISCLAIMS ALL INDIRECT OR IMPLIED WARRANTIES TO THE FULL EXTENT ALLOWED BY APPLICABLE LAW,
+# INCLUDING WITHOUT LIMITATION ALL IMPLIED WARRANTIES OF NON-INFRINGEMENT, MERCHANTABILITY, TITLE OR FITNESS FOR ANY PARTICULAR PURPOSE. 
+
+# THE SOFTWARE IS DELIVERED IN ACCORDANCE WITH TERMS AND CONDITIONS SET OUT IN THE AGREED MEMORANDUM OF AGREEMENT (P5056-C-001 V1.0)
+# AND THE SCHEDULE OF TECHNOLOGY WITH A RESTRICTIVE ENCUMBRANCE (P5056-M-005 V1.0). 
+
+Parameters:
+  LexLambdaArn:
+    Type: String
+    Description: ARN of the lambda function that will be associated with the lex bot alias
+    
+  
+Resources:
+
+  BotRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal: 
+              Service:
+                - lexv2.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: LexRuntimeRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "polly:SynthesizeSpeech"
+                Resource: "*"
+
+
+  ChalkbotLexBot:
+    DependsOn: BotRuntimeRole
+    Type: AWS::Lex::Bot
+    Properties:
+      Name: "ChalkbotLexBot"
+      RoleArn: !GetAtt BotRuntimeRole.Arn
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 300 # if no conversation occurs during this time, the session expires
+      AutoBuildBotLocales: true
+      BotLocales:
+        - LocaleId: "en_GB"
+          NluConfidenceThreshold: 0.4
+          VoiceSettings:
+            VoiceId: "Amy"
+          Intents:
+            - Name: "UnusedIntent"
+              Description: "Lex requires at least one custom intent"
+              SampleUtterances:
+                - Utterance: "Hello"
+                - Utterance: "Greetings"
+                - Utterance: "Good day"
+                - Utterance: "Good morning"
+                - Utterance: "Good afternoon"
+              FulfillmentCodeHook:
+                Enabled: true
+                IsActive: true 
+            - Name: "FallbackIntent"
+              Description: "Default intent when no other intent matches"
+              ParentIntentSignature: "AMAZON.FallbackIntent"
+              FulfillmentCodeHook:
+                Enabled: true
+                IsActive: true 
+
+
+  ChalkbotLexBotVersion:
+    DependsOn: ChalkbotLexBot 
+    Type: AWS::Lex::BotVersion
+    Properties:
+      BotId: !Ref ChalkbotLexBot
+      BotVersionLocaleSpecification:
+        - LocaleId: en_GB
+          BotVersionLocaleDetails:
+            SourceBotVersion: DRAFT
+  
+  ChalkbotLexBotAlias:
+    DependsOn: ChalkbotLexBotVersion
+    Type: AWS::Lex::BotAlias
+    Properties:
+      BotId: !Ref ChalkbotLexBot
+      BotAliasName: "ChalkbotLexVersion1Alias"
+      BotVersion: !GetAtt ChalkbotLexBotVersion.BotVersion
+      BotAliasLocaleSettings:
+        - LocaleId: "en_GB"
+          BotAliasLocaleSetting:
+            Enabled: true
+            CodeHookSpecification:
+              LambdaCodeHook:
+                CodeHookInterfaceVersion: "1.0"
+                LambdaArn: !Ref LexLambdaArn
+
+  LexToLambdaPermission:
+    DependsOn: ChalkbotLexBotAlias
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !Ref LexLambdaArn
+      Principal: lexv2.amazonaws.com
+      SourceArn: !GetAtt ChalkbotLexBotAlias.Arn
+
+Outputs:
+  ChalkbotLexBotAliasArn:
+    Description: "Lex bot alias ARN"
+    Value: !GetAtt ChalkbotLexBotAlias.Arn
+  LexBotId:
+    Description: "Lex bot id"
+    Value: !GetAtt ChalkbotLexBot.Id
+  LexBotAliasId:
+    Description: "Lex bot alias id"
+    Value: !GetAtt ChalkbotLexBotAlias.BotAliasId

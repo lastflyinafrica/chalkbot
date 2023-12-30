@@ -1,0 +1,234 @@
+# CAMBRIDGE LICENSES THE SOFTWARE "AS IS," AND MAKES NO EXPRESS OR IMPLIED WARRANTY OF ANY KIND. 
+# CAMBRIDGE SPECIFICALLY DISCLAIMS ALL INDIRECT OR IMPLIED WARRANTIES TO THE FULL EXTENT ALLOWED BY APPLICABLE LAW,
+# INCLUDING WITHOUT LIMITATION ALL IMPLIED WARRANTIES OF NON-INFRINGEMENT, MERCHANTABILITY, TITLE OR FITNESS FOR ANY PARTICULAR PURPOSE. 
+
+# THE SOFTWARE IS DELIVERED IN ACCORDANCE WITH TERMS AND CONDITIONS SET OUT IN THE AGREED MEMORANDUM OF AGREEMENT (P5056-C-001 V1.0)
+# AND THE SCHEDULE OF TECHNOLOGY WITH A RESTRICTIVE ENCUMBRANCE (P5056-M-005 V1.0). 
+
+
+default:
+  tags:
+    - smokey-docker-linux-internet
+
+workflow:
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: '$CI_COMMIT_REF_SLUG == "main"'  
+
+stages:
+  - Lint
+  - Package
+  - Push Lambda
+  - TF Plan
+  - Deploy
+
+.python-image:
+  image: python:3.11-slim-bullseye
+  before_script: 
+    - apt update
+    - apt install -y zip
+    - python -m venv venv
+    - source venv/bin/activate
+    - pip install black==22.12.0 flake8==6.1.0
+
+flake8:
+  extends:
+    - .python-image
+  stage: Lint
+  script:
+    - cd python
+    - flake8 --ignore=E501,W503,Q000,D100,D103 .
+
+black:
+  extends:
+    - .python-image
+  stage: Lint
+  script:
+    - cd python
+    - black --check .
+
+
+Package Connect Authentication Lambda:
+  stage: Package
+  extends:
+    - .python-image
+  script:
+    - cd python/authentication-lambda
+    - ./package.sh
+  artifacts:
+    paths:
+      - $CI_PROJECT_DIR/python/authentication-lambda/connect-auth-lambda.zip
+
+
+Package Warm Up Lex Lambda:
+  stage: Package
+  extends:
+    - .python-image
+  script:
+    - cd python/warm-up-lex-lambda
+    - ./package.sh
+  artifacts:
+    paths:
+      - $CI_PROJECT_DIR/python/warm-up-lex-lambda/warm-up-lex-lambda.zip
+
+
+.dind_image:
+  image: docker:24.0.4
+  services:
+    - name: docker:24.0.4-dind
+      alias: docker
+      command:
+        # Avoid the Docker-in-docker default network bridge from clashing with
+        # CC's 172.18.*.* subnet
+        - "--bip=172.19.0.1/16"
+        # Use Smokey DNS server to ensure dockerhub-proxy.uk.cambridgeconsultants.com can be
+        # resolved
+        - "--dns=192.168.120.1"
+        # Set proxy to avoid rate limiting
+        - "--registry-mirror=https://dockerhub-proxy.uk.cambridgeconsultants.com"
+  tags:
+    - smokey-docker-linux-internet-privileged
+
+
+Push GPT Lambda Container to ECR:
+  stage: Push Lambda
+  extends:
+    - .dind_image
+  variables:
+    ECR_URL: 885938888885.dkr.ecr.eu-west-2.amazonaws.com
+    REPOSITORY_NAME: chalkbot-ecr
+    IMAGE_TAG: latest
+  before_script:
+    - apk --no-cache add python3 py3-pip
+    - pip3 install --upgrade pip
+    - pip3 install awscli
+    - mkdir -p ~/.aws/
+    - mv ${AWS_CREDENTIALS} ~/.aws/credentials
+    - mv ${AWS_CONFIG} ~/.aws/config
+  script:
+    - cd python/gpt-lambda
+    - aws ecr get-login-password --region eu-west-2 | docker login --username AWS --password-stdin $ECR_URL
+    - docker build -t chalkbot-ecr:latest .
+    - docker tag chalkbot-ecr:latest "$ECR_URL/$REPOSITORY_NAME:$IMAGE_TAG"
+    - docker push "$ECR_URL/$REPOSITORY_NAME:$IMAGE_TAG"
+  rules:
+    - if: '$CI_COMMIT_REF_SLUG == "main"'
+
+
+.tf_setup:
+  image:
+    name: hashicorp/terraform:1.5.6
+    entrypoint: 
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  before_script:
+    - apk add -U python3 py3-pip
+    - pip3 install awscli
+    - mkdir -p ~/.aws/
+    - mv ${AWS_CREDENTIALS} ~/.aws/credentials
+    - mv ${AWS_CONFIG} ~/.aws/config
+    - cd infrastructure
+    - |
+      terraform init \
+        -input=false \
+        -backend-config "bucket=chalkbot-tf-state" \
+        -backend-config "key=state/terraform.tfstate" \
+        -backend-config "region=eu-west-2" \
+        -backend-config "dynamodb_table=terraform-locks"
+
+.tf_plan:
+  extends:
+    - .tf_setup
+  stage: TF Plan
+  script:
+    - |
+      cp $CI_PROJECT_DIR/python/authentication-lambda/connect-auth-lambda.zip $CI_PROJECT_DIR/infrastructure/lambda/connect-authentication/
+      cp $CI_PROJECT_DIR/python/warm-up-lex-lambda/warm-up-lex-lambda.zip $CI_PROJECT_DIR/infrastructure/lambda/warm-up-lex/
+
+      terraform plan \
+        -var "openai_api_key=$OPENAI_API_KEY" \
+        -var "connect_user_password=$CONNECT_ADMIN_PASSWORD" \
+        -var "commit_hash=$CI_COMMIT_SHA" \
+        -out $CI_PROJECT_DIR/terraform.plan
+  artifacts:
+    paths:
+      - $CI_PROJECT_DIR/terraform.plan
+
+
+TF Plan MR:
+  extends:
+    - .tf_plan
+  needs:
+    - Package Connect Authentication Lambda
+    - Package Warm Up Lex Lambda
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+
+
+TF Plan Main:
+  extends:
+    - .tf_plan
+  needs:
+    - Package Connect Authentication Lambda
+    - Package Warm Up Lex Lambda
+    - Push GPT Lambda Container to ECR
+  rules:
+    - if: '$CI_COMMIT_REF_SLUG == "main"'
+
+    
+TF Apply:
+  extends:
+    - .tf_setup
+  stage: Deploy
+  script:
+    - cp $CI_PROJECT_DIR/python/authentication-lambda/connect-auth-lambda.zip $CI_PROJECT_DIR/infrastructure/lambda/connect-authentication
+    - cp $CI_PROJECT_DIR/python/warm-up-lex-lambda/warm-up-lex-lambda.zip $CI_PROJECT_DIR/infrastructure/lambda/warm-up-lex/
+
+
+    - terraform apply -auto-approve $CI_PROJECT_DIR/terraform.plan
+
+    # Extract outputs from terraform
+    - terraform output -json > ${CI_PROJECT_DIR}/terraform.json
+  artifacts:
+    paths:
+      - $CI_PROJECT_DIR/terraform.json
+  needs:
+    - TF Plan Main
+    - Package Connect Authentication Lambda
+    - Package Warm Up Lex Lambda
+    - Push GPT Lambda Container to ECR
+  rules:
+    - if: '$CI_COMMIT_REF_SLUG == "main"'
+
+
+# Lex v2 support is poor for terraform so need to use aws cli to:
+# - associate the lex bot alias with the connect instance
+# - assign a phone number with the connect contact flow
+Lex Connect Integration:
+  image: alpine:latest
+  stage: Deploy
+  before_script:
+    - apk add -U python3 py3-pip jq
+    - python -m venv myenv
+    - source myenv/bin/activate
+    - pip3 install awscli
+    - mkdir -p ~/.aws/
+    - mv ${AWS_CREDENTIALS} ~/.aws/credentials
+    - mv ${AWS_CONFIG} ~/.aws/config
+  script:
+    - CONNECT_INSTANCE_ID=$(jq -r '.connect_instance_id.value' ${CI_PROJECT_DIR}/terraform.json)
+    - LEX_ALIAS_ARN=$(jq -r '.lexbot_stack_output.value.ChalkbotLexBotAliasArn' ${CI_PROJECT_DIR}/terraform.json)
+    - CONNECT_PHONE_NUMBER_ID=$(jq -r '.connect_phone_number_id.value' ${CI_PROJECT_DIR}/terraform.json)
+    - CONNECT_CONTACT_FLOW_ARN=$(jq -r '.connect_contact_flow_arn.value' ${CI_PROJECT_DIR}/terraform.json)
+    - echo $CONNECT_CONTACT_FLOW_ARN
+  
+    - aws connect associate-bot --instance-id $CONNECT_INSTANCE_ID --lex-v2-bot AliasArn=$LEX_ALIAS_ARN
+    - |
+      aws connect associate-phone-number-contact-flow \
+        --phone-number-id $CONNECT_PHONE_NUMBER_ID \
+        --instance-id $CONNECT_INSTANCE_ID \
+        --contact-flow-id $CONNECT_CONTACT_FLOW_ARN
+  needs:
+    - TF Apply
+  rules:
+    - if: '$CI_COMMIT_REF_SLUG == "main"'
